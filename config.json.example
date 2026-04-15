@@ -1,0 +1,19 @@
+{
+  "check_interval": 600,        //檢查頻率，預設10分鐘一次
+  "telegram": {
+    "chat_id": "-100123456789", //發送目標頻道
+    "topic_id": null,           //目標Topic
+    "disable_preview": false    //是否顯示連結預覽
+  },
+  "accounts": [
+    "VitalikButerin",
+    "elonmusk",
+    "10Kdogcoin"
+  ],
+  "nitter_instances": [
+    "https://nitter.net",
+    "https://nitter.privacyredirect.com",
+    "https://nitter.perennialte.ch",
+    "https://nitter.poast.org"
+  ]
+}
