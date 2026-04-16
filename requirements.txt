@@ -1,3 +1,4 @@
 feedparser
+aiohttp
 python-dotenv
 requests

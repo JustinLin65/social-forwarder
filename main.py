@@ -1,51 +1,72 @@
 import os
-import time
+import asyncio
 import json
+import aiohttp
 import feedparser
-import requests
-from dotenv import load_dotenv
+import time
+from datetime import datetime
 from urllib.parse import urlparse
+from dotenv import load_dotenv
 
-# 1. 初始化與讀取配置
+# 載入環境變數
 load_dotenv()
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 
+# ==================== 配置與路徑 ====================
 CONFIG_FILE = "config.json"
 DB_FILE = "processed_posts.json"
 
-def load_config():
-    """載入 JSON 配置文件"""
-    if not os.path.exists(CONFIG_FILE):
-        print(f"錯誤: 找不到 {CONFIG_FILE}")
+# 全域變數
+PROCESSED_DATA = {}
+DEBUG_MODE = False
+
+# ==================== 核心邏輯 ====================
+
+def load_all_configs():
+    """載入配置文件"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[!] 讀取 {CONFIG_FILE} 失敗: {e}")
+            exit(1)
+    else:
+        print(f"[!] 警告：找不到 {CONFIG_FILE}")
         exit(1)
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 def load_db():
-    """載入已處理過的貼文紀錄"""
+    """載入已處理紀錄"""
+    global PROCESSED_DATA
     if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                PROCESSED_DATA = json.load(f)
+                print(f"[V] 已載入歷史紀錄：{len(PROCESSED_DATA)} 個帳號")
+        except Exception as e:
+            print(f"[!] 讀取 {DB_FILE} 失敗: {e}")
+    else:
+        print(f"[*] 建立新的歷史紀錄庫")
 
-def save_db(data):
+def save_db():
     """儲存紀錄"""
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(PROCESSED_DATA, f, indent=2)
+    except Exception as e:
+        print(f"[!] 儲存 {DB_FILE} 失敗: {e}")
 
 def convert_to_x_link(nitter_url):
     """將 Nitter 連結轉換為 X.com 連結"""
     try:
         parsed = urlparse(nitter_url)
-        # 取得路徑部分 (例如 /VitalikButerin/status/12345)
-        # 並確保移除末尾的 #m 
         path = parsed.path
         return f"https://x.com{path}"
     except Exception:
         return nitter_url
 
-def send_telegram(config, text):
-    """發送訊息至 Telegram (支援 Topic ID)"""
+async def send_telegram(session, config, text):
+    """發送訊息至 Telegram (非同步)"""
     tg_conf = config.get("telegram", {})
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     
@@ -55,81 +76,107 @@ def send_telegram(config, text):
         "parse_mode": "HTML",
         "disable_web_page_preview": tg_conf.get("disable_preview", False)
     }
-
-    # 如果有設定 Topic ID (message_thread_id)
+    
     if tg_conf.get("topic_id"):
         payload["message_thread_id"] = tg_conf.get("topic_id")
 
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"TG 發送失敗 (HTTP {response.status_code}): {response.text}")
-        return response.status_code == 200
+        async with session.post(url, json=payload, timeout=15) as resp:
+            if resp.status != 200:
+                print(f"   [X] TG 發送失敗 (HTTP {resp.status}): {await resp.text()}")
+            return resp.status == 200
     except Exception as e:
-        print(f"Telegram 連線失敗: {e}")
+        print(f"   [!] Telegram 發送異常: {e}")
         return False
 
-def fetch_from_nitter(account, instances):
-    """輪詢 Nitter 實例獲取數據"""
+async def fetch_rss(session, url):
+    """獲取並解析 RSS 內容"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=20) as resp:
+            if resp.status == 200:
+                content = await resp.text()
+                return feedparser.parse(content)
+            return None
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"   [!] RSS 獲取失敗 ({url}): {e}")
+        return None
+
+async def check_account(session, account, instances, config):
+    """檢查單個帳號的新推文"""
+    global PROCESSED_DATA
+    
     for instance in instances:
         rss_url = f"{instance.rstrip('/')}/{account}/rss"
-        try:
-            feed = feedparser.parse(rss_url)
-            if feed.entries:
-                return feed.entries
-            else:
-                print(f"[-] 實例 {instance} 無法取得 @{account} 內容")
-        except Exception as e:
-            print(f"[-] 實例 {instance} 出錯: {e}")
-    return None
-
-def main():
-    print("=== X Monitor 服務啟動 ===")
-    processed_data = load_db()
-
-    while True:
-        config = load_config()
-        accounts = config.get("accounts", [])
-        instances = config.get("nitter_instances", [])
-        interval = config.get("check_interval", 600)
-
-        for account in accounts:
-            entries = fetch_from_nitter(account, instances)
-            
-            if not entries:
-                print(f"[!] 跳過 @{account}，所有實例皆無法存取。")
-                continue
-
+        feed = await fetch_rss(session, rss_url)
+        
+        if feed and feed.entries:
             new_posts = []
-            for entry in entries[:5]:
+            for entry in feed.entries[:10]: # 檢查最近 10 則
                 post_id = entry.id
-                title = entry.title
-                nitter_link = entry.link
+                title = getattr(entry, 'title', '')
+                link = getattr(entry, 'link', '')
 
-                # 檢查是否已處理
-                if account in processed_data and processed_data[account] == post_id:
-                    break 
-
-                # 忽略轉發貼文
+                # 比對紀錄
+                if account in PROCESSED_DATA and PROCESSED_DATA[account] == post_id:
+                    break
+                
+                # 排除轉推 (Nitter 風格)
                 if title.startswith("RT by") or title.startswith("RT @"):
                     continue
-
-                # 轉換連結：將 nitter.net/... 轉為 x.com/...
-                x_link = convert_to_x_link(nitter_link)
+                
+                x_link = convert_to_x_link(link)
                 new_posts.append((post_id, x_link))
 
-            # 倒序發送
-            for p_id, p_link in reversed(new_posts):
-                print(f"[+] 發現新推文 @{account}: {p_link}")
-                message = f"<b>來自 @{account} 的新推文</b>\n\n{p_link}"
-                
-                if send_telegram(config, message):
-                    processed_data[account] = p_id
-                    save_db(processed_data)
-                    time.sleep(2)
+            if new_posts:
+                print(f"[*] @{account} 發現 {len(new_posts)} 則新推文")
+                for p_id, p_link in reversed(new_posts):
+                    message = f"<b>來自 @{account} 的新推文</b>\n\n{p_link}"
+                    if await send_telegram(session, config, message):
+                        PROCESSED_DATA[account] = p_id
+                        save_db()
+                        await asyncio.sleep(1) # 避開速率限制
+            return # 成功獲取則跳出實例輪詢
+        
+    print(f"[-] @{account} 所有實例目前皆無法存取")
 
-        print(f"[*] 檢查完畢，等候 {interval} 秒...")
-        time.sleep(interval)
+async def main_loop():
+    global DEBUG_MODE
+    print(f"----------------------------------------")
+    print(f"Social Forwarder 啟動中...")
+    print(f"當前時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"----------------------------------------")
+
+    load_db()
+    
+    if not BOT_TOKEN:
+        print("[X] 錯誤：.env 缺少 TG_BOT_TOKEN")
+        return
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            config = load_all_configs()
+            DEBUG_MODE = config.get("debug", False)
+            accounts = config.get("accounts", [])
+            instances = config.get("nitter_instances", [])
+            interval = config.get("check_interval", 600)
+
+            print(f"[*] 開始輪詢 {len(accounts)} 個帳號...")
+            
+            for account in accounts:
+                await check_account(session, account, instances, config)
+                await asyncio.sleep(2) # 帳號間間隔
+
+            print(f"[*] 輪詢結束，等候 {interval} 秒...")
+            await asyncio.sleep(interval)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\n[!] 程式已手動停止")
+    except Exception as e:
+        print(f"\n[X] 發生嚴重錯誤: {e}")
