@@ -36,6 +36,15 @@ TG_BOT_TOKEN='your_telegram_bot_token'
 - `check_interval`：檢查間隔（秒）。
 - `telegram`：目標頻道 ID 與主題 ID。
 
+## 歷史紀錄 (processed_posts.json)
+
+`processed_posts.json` 用於記錄每個帳號最後一次發送的貼文 ID，以確保貼文不會重複發送。
+
+如果你需要從其他地方轉移紀錄或手動設定起始點，可以參考 `processed_posts.json.example`：
+
+1. 複製 `processed_posts.json.example` 並重新命名為 `processed_posts.json`。
+2. 填入帳號名稱與對應的貼文 ID (Snowflake ID)。
+
 ## 啟動
 
 ```bash
