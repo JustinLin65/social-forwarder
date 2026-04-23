@@ -4,6 +4,8 @@ import json
 import aiohttp
 import feedparser
 import time
+import html
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -21,6 +23,14 @@ PROCESSED_DATA = {}
 DEBUG_MODE = False
 
 # ==================== 核心邏輯 ====================
+
+def safe_truncate(text, limit):
+    """安全截斷文字，保留 Telegram 限制範圍內"""
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit-3] + "..."
 
 def load_all_configs():
     """載入配置文件"""
@@ -65,26 +75,79 @@ def convert_to_x_link(nitter_url):
     except Exception:
         return nitter_url
 
-async def send_telegram(session, config, text):
-    """發送訊息至 Telegram (非同步)"""
+async def send_telegram(session, config, text, media_items=None):
+    """發送訊息至 Telegram (支援圖片與影片)"""
     tg_conf = config.get("telegram", {})
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    bot_token = BOT_TOKEN
+    chat_id = tg_conf.get("chat_id")
+    topic_id = tg_conf.get("topic_id")
+    disable_preview = not tg_conf.get("show_preview", True)
     
-    payload = {
-        "chat_id": tg_conf.get("chat_id"),
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": tg_conf.get("disable_preview", False)
+    # 基本 Payload
+    base_payload = {
+        "chat_id": chat_id,
     }
-    
-    if tg_conf.get("topic_id"):
-        payload["message_thread_id"] = tg_conf.get("topic_id")
+    if topic_id:
+        base_payload["message_thread_id"] = topic_id
 
     try:
-        async with session.post(url, json=payload, timeout=15) as resp:
-            if resp.status != 200:
-                print(f"   [X] TG 發送失敗 (HTTP {resp.status}): {await resp.text()}")
-            return resp.status == 200
+        if media_items and len(media_items) > 0:
+            # 媒體說明文字限制為 1024 字元
+            safe_text = safe_truncate(text, 1024)
+            
+            if len(media_items) == 1:
+                # 單一媒體 (圖片或影片)
+                item = media_items[0]
+                m_type = item.get("type", "photo")
+                m_url = item.get("url")
+                
+                method = "sendPhoto" if m_type == "photo" else "sendVideo"
+                payload = {
+                    **base_payload,
+                    m_type: m_url,
+                    "caption": safe_text,
+                    "parse_mode": "HTML"
+                }
+                
+                url = f"https://api.telegram.org/bot{bot_token}/{method}"
+                async with session.post(url, json=payload, timeout=30) as resp:
+                    return resp.status == 200
+            else:
+                # 媒體組 (Media Group) - 支援混合圖片與影片
+                url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
+                media = []
+                for i, item in enumerate(media_items):
+                    m_type = item.get("type", "photo")
+                    m_url = item.get("url")
+                    
+                    media_obj = {
+                        "type": m_type,
+                        "media": m_url,
+                    }
+                    if i == 0:
+                        media_obj["caption"] = safe_text
+                        media_obj["parse_mode"] = "HTML"
+                    media.append(media_obj)
+                
+                payload = {
+                    **base_payload,
+                    "media": media
+                }
+                async with session.post(url, json=payload, timeout=40) as resp:
+                    return resp.status == 200
+        else:
+            # 僅文字訊息限制為 4096 字元
+            safe_text = safe_truncate(text, 4096)
+            
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                **base_payload,
+                "text": safe_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_preview
+            }
+            async with session.post(url, json=payload, timeout=15) as resp:
+                return resp.status == 200
     except Exception as e:
         print(f"   [!] Telegram 發送異常: {e}")
         return False
@@ -109,6 +172,10 @@ async def check_account(session, account, instances, config):
     """檢查單個帳號的新推文"""
     global PROCESSED_DATA
     
+    tg_conf = config.get("telegram", {})
+    show_link = tg_conf.get("show_link", True)
+    show_text = tg_conf.get("show_text", True)
+
     for instance in instances:
         rss_url = f"{instance.rstrip('/')}/{account}/rss"
         feed = await fetch_rss(session, rss_url)
@@ -129,13 +196,62 @@ async def check_account(session, account, instances, config):
                     continue
                 
                 x_link = convert_to_x_link(link)
-                new_posts.append((post_id, x_link))
+                
+                # 擷取媒體 (圖片與影片)
+                media_items = []
+                description = getattr(entry, 'description', '')
+                if description:
+                    # 1. 擷取影片
+                    video_matches = re.findall(r'<source [^>]*src="([^"]+)"', description)
+                    for v_url in video_matches:
+                        if '/video/' in v_url or v_url.endswith('.mp4'):
+                            full_url = f"{instance.rstrip('/')}{v_url}" if v_url.startswith('/') else v_url
+                            media_items.append({"type": "video", "url": full_url})
+                    
+                    # 2. 擷取圖片
+                    img_matches = re.findall(r'<img [^>]*src="([^"]+)"', description)
+                    for img_url in img_matches:
+                        if '/pic/' in img_url and '/profile_images/' not in img_url:
+                            full_url = f"{instance.rstrip('/')}{img_url}" if img_url.startswith('/') else img_url
+                            if not any(m["url"] == full_url for m in media_items):
+                                media_items.append({"type": "photo", "url": full_url})
+
+                new_posts.append((post_id, x_link, title, media_items))
 
             if new_posts:
                 print(f"[*] @{account} 發現 {len(new_posts)} 則新推文")
-                for p_id, p_link in reversed(new_posts):
-                    message = f"<b>來自 @{account} 的新推文</b>\n\n{p_link}"
-                    if await send_telegram(session, config, message):
+                for p_id, p_link, p_text, p_media in reversed(new_posts):
+                    success = False
+                    
+                    # --- 第一部分：Link (獨立發送) ---
+                    if show_link:
+                        await send_telegram(session, config, p_link)
+                        await asyncio.sleep(0.5)
+                    
+                    # --- 第二部分：Text 與標題 (獨立發送) ---
+                    # 只要 show_text 開啟，就發送帳號標題 (如果連文字也有就一起)
+                    if show_text:
+                        header = f"<b>來自 @{account} 的新推文</b>"
+                        full_msg_text = header
+                        if p_text:
+                            full_msg_text += f"\n\n{html.escape(p_text)}"
+                        
+                        # 發送純文字訊息
+                        if await send_telegram(session, config, full_msg_text):
+                            success = True
+                        await asyncio.sleep(0.5)
+
+                    # --- 第三部分：Media (獨立發送) ---
+                    if show_text and p_media:
+                        # 獨立發送媒體內容，不帶說明文字 (Caption 為空)
+                        if await send_telegram(session, config, "", p_media):
+                            success = True
+
+                    # 如果只有開啟 show_link，則以第一部分的發送結果作為成功判斷
+                    if show_link and not show_text:
+                        success = True
+
+                    if success:
                         PROCESSED_DATA[account] = p_id
                         save_db()
                         await asyncio.sleep(1) # 避開速率限制

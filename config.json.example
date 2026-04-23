@@ -1,9 +1,12 @@
 {
-  "check_interval": 600,        //檢查頻率，預設10分鐘一次
+  "debug": false,
+  "check_interval": 600,
   "telegram": {
-    "chat_id": "-100123456789", //發送目標頻道
-    "topic_id": null,           //目標Topic
-    "disable_preview": false    //是否顯示連結預覽
+    "chat_id": "-100123456789",
+    "topic_id": null,
+    "show_link": true,
+    "show_preview": true,
+    "show_text": true
   },
   "accounts": [
     "VitalikButerin",
