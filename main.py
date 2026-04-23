@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 # 載入環境變數
 load_dotenv()
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # ==================== 配置與路徑 ====================
 CONFIG_FILE = "config.json"
@@ -31,6 +32,55 @@ def safe_truncate(text, limit):
     if len(text) <= limit:
         return text
     return text[:limit-3] + "..."
+
+async def process_with_ai(session, text, ai_config):
+    """將文字透過 AI (Gemini) 進行處理，包含重試機制"""
+    if not GEMINI_API_KEY:
+        print("   [!] 錯誤：缺少 GEMINI_API_KEY，無法進行 AI 處理")
+        return text
+    
+    model = ai_config.get("model", "gemini-2.5-flash")
+    prompt = ai_config.get("prompt", "")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": f"{prompt}\n\n{text}"}]
+        }]
+    }
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with session.post(url, json=payload, timeout=30) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    candidates = result.get("candidates", [])
+                    if candidates:
+                        content = candidates[0].get("content", {})
+                        parts = content.get("parts", [])
+                        if parts:
+                            return parts[0].get("text", text).strip()
+                    return text
+                elif resp.status in [429, 503]:
+                    wait_time = (attempt + 1) * 5  # 指數退避：5s, 10s, 15s
+                    print(f"   [!] Gemini API 忙碌 (HTTP {resp.status})，將在 {wait_time} 秒後進行第 {attempt+1} 次重試...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    error_msg = await resp.text()
+                    print(f"   [!] Gemini API 請求失敗 (HTTP {resp.status}): {error_msg}")
+                    return text
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5
+                print(f"   [!] AI 處理異常: {e}，正在重試...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"   [!] AI 處理在 {max_retries} 次嘗試後仍失敗: {e}")
+                return text
+    return text
 
 def load_all_configs():
     """載入配置文件"""
@@ -173,8 +223,10 @@ async def check_account(session, account, instances, config):
     global PROCESSED_DATA
     
     tg_conf = config.get("telegram", {})
+    ai_conf = config.get("ai", {})
     show_link = tg_conf.get("show_link", True)
     show_text = tg_conf.get("show_text", True)
+    ai_enabled = ai_conf.get("enabled", False)
 
     for instance in instances:
         rss_url = f"{instance.rstrip('/')}/{account}/rss"
@@ -216,7 +268,13 @@ async def check_account(session, account, instances, config):
                             if not any(m["url"] == full_url for m in media_items):
                                 media_items.append({"type": "photo", "url": full_url})
 
-                new_posts.append((post_id, x_link, title, media_items))
+                # --- AI 處理 ---
+                processed_text = title
+                if ai_enabled and title:
+                    print(f"   [*] 正在對 @{account} 的貼文進行 AI 處理...")
+                    processed_text = await process_with_ai(session, title, ai_conf)
+
+                new_posts.append((post_id, x_link, processed_text, media_items))
 
             if new_posts:
                 print(f"[*] @{account} 發現 {len(new_posts)} 則新推文")

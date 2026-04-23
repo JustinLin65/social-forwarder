@@ -1,6 +1,11 @@
 {
   "debug": false,
   "check_interval": 600,
+  "ai": {
+    "enabled": false,
+    "model": "gemini-2.5-flash",
+    "prompt": "請幫我將這篇英文貼文翻譯成繁體中文，並保持原意："
+  },
   "telegram": {
     "chat_id": "-100123456789",
     "topic_id": null,

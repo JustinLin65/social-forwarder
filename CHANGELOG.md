@@ -3,7 +3,17 @@
 本專案的所有顯著變更將記錄在此檔案中。
 格式參考自 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)。
 
-## [1.0.0] - 2026-04
+## [1.1.0] - 2026-04-23
+
+### Added
+
+- **AI 處理功能**：整合 Google Gemini API。
+    - 支援自動翻譯、總結或改寫貼文內容。
+    - 內建指數退避 (Exponential Backoff) 重試機制，應對 API 速率限制 (429)。
+    - 可自定義 AI Prompt 與模型版本。
+- **配置更新**：新增 `ai` 配置區塊。
+
+## [1.0.0] - 2026-04-22
 
 ### Added
 
