@@ -1,4 +1,4 @@
-# Social Forwarder v1.1.1
+# Social Forwarder v1.1.2
 import os
 import asyncio
 import json
@@ -26,13 +26,37 @@ DEBUG_MODE = False
 
 # ==================== 核心邏輯 ====================
 
-def safe_truncate(text, limit):
-    """安全截斷文字，保留 Telegram 限制範圍內"""
+def smart_split(text, limit):
+    """將文字依照限制長度拆分，優先尋找句號、逗號或換行符號"""
     if not text:
-        return ""
+        return [""]
     if len(text) <= limit:
-        return text
-    return text[:limit-3] + "..."
+        return [text]
+    
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+            
+        split_at = -1
+        # 尋找分割點，優先順序：換行 > 中文句號 > 英文句號 > 中文逗號 > 英文逗號 > 空格
+        for d in ["\n", "。", ".", "，", ",", " "]:
+            pos = text.rfind(d, 0, limit)
+            if pos > split_at:
+                split_at = pos
+        
+        if split_at == -1:
+            split_at = limit
+        else:
+            split_at += 1 # 包含分隔符
+            
+        chunk = text[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        text = text[split_at:].lstrip()
+        
+    return chunks if chunks else [""]
 
 async def process_with_ai(session, text, ai_config):
     """將文字透過 AI (Gemini) 進行處理，包含重試機制"""
@@ -139,7 +163,7 @@ def convert_to_x_link(nitter_url):
         return nitter_url
 
 async def send_telegram(session, config, text, media_items=None):
-    """發送訊息至 Telegram (支援圖片與影片)"""
+    """發送訊息至 Telegram (支援圖片與影片，並具備長文字自動拆分功能)"""
     tg_conf = config.get("telegram", {})
     bot_token = BOT_TOKEN
     chat_id = tg_conf.get("chat_id")
@@ -153,11 +177,25 @@ async def send_telegram(session, config, text, media_items=None):
     if topic_id:
         base_payload["message_thread_id"] = topic_id
 
+    async def send_text_msg(msg_text):
+        """內部的純文字發送小助手"""
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            **base_payload,
+            "text": msg_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_preview
+        }
+        async with session.post(url, json=payload, timeout=15) as resp:
+            return resp.status == 200
+
     try:
         if media_items and len(media_items) > 0:
-            # 媒體說明文字限制為 1024 字元
-            safe_text = safe_truncate(text, 1024)
+            # 媒體說明文字 (Caption) 限制為 1024 字元
+            chunks = smart_split(text, 1024)
+            first_caption = chunks[0] if chunks else ""
             
+            success = False
             if len(media_items) == 1:
                 # 單一媒體 (圖片或影片)
                 item = media_items[0]
@@ -168,15 +206,15 @@ async def send_telegram(session, config, text, media_items=None):
                 payload = {
                     **base_payload,
                     m_type: m_url,
-                    "caption": safe_text,
+                    "caption": first_caption,
                     "parse_mode": "HTML"
                 }
                 
                 url = f"https://api.telegram.org/bot{bot_token}/{method}"
                 async with session.post(url, json=payload, timeout=30) as resp:
-                    return resp.status == 200
+                    success = (resp.status == 200)
             else:
-                # 媒體組 (Media Group) - 支援混合圖片與影片
+                # 媒體組 (Media Group)
                 url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
                 media = []
                 for i, item in enumerate(media_items):
@@ -188,7 +226,7 @@ async def send_telegram(session, config, text, media_items=None):
                         "media": m_url,
                     }
                     if i == 0:
-                        media_obj["caption"] = safe_text
+                        media_obj["caption"] = first_caption
                         media_obj["parse_mode"] = "HTML"
                     media.append(media_obj)
                 
@@ -197,20 +235,25 @@ async def send_telegram(session, config, text, media_items=None):
                     "media": media
                 }
                 async with session.post(url, json=payload, timeout=40) as resp:
-                    return resp.status == 200
-        else:
-            # 僅文字訊息限制為 4096 字元
-            safe_text = safe_truncate(text, 4096)
+                    success = (resp.status == 200)
             
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                **base_payload,
-                "text": safe_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": disable_preview
-            }
-            async with session.post(url, json=payload, timeout=15) as resp:
-                return resp.status == 200
+            # 如果文字還有剩餘，發送後續訊息
+            if success and len(chunks) > 1:
+                for chunk in chunks[1:]:
+                    await asyncio.sleep(0.5)
+                    await send_text_msg(chunk)
+            
+            return success
+        else:
+            # 純文字訊息限制為 4096 字元
+            chunks = smart_split(text, 4096)
+            overall_success = True
+            for i, chunk in enumerate(chunks):
+                if not chunk: continue
+                if i > 0: await asyncio.sleep(0.5)
+                res = await send_text_msg(chunk)
+                if i == 0: overall_success = res # 以第一則發送結果為主
+            return overall_success
     except Exception as e:
         print(f"   [!] Telegram 發送異常: {e}")
         return False
