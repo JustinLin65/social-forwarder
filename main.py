@@ -1,3 +1,4 @@
+# Social Forwarder v1.1.1
 import os
 import asyncio
 import json
@@ -35,9 +36,13 @@ def safe_truncate(text, limit):
 
 async def process_with_ai(session, text, ai_config):
     """將文字透過 AI (Gemini) 進行處理，包含重試機制"""
+    # 預先定義失敗時的回傳內容
+    fail_response = f"(API調用失敗，直接發送原文)\n\n{text}"
+
     if not GEMINI_API_KEY:
         print("   [!] 錯誤：缺少 GEMINI_API_KEY，無法進行 AI 處理")
-        return text
+        print("   [!] API調用失敗，直接發送原文")
+        return fail_response
     
     model = ai_config.get("model", "gemini-2.5-flash")
     prompt = ai_config.get("prompt", "")
@@ -62,7 +67,10 @@ async def process_with_ai(session, text, ai_config):
                         parts = content.get("parts", [])
                         if parts:
                             return parts[0].get("text", text).strip()
-                    return text
+                    
+                    # 若狀態碼 200 但無內容
+                    print("   [!] API調用失敗，直接發送原文")
+                    return fail_response
                 elif resp.status in [429, 503]:
                     wait_time = (attempt + 1) * 5  # 指數退避：5s, 10s, 15s
                     print(f"   [!] Gemini API 忙碌 (HTTP {resp.status})，將在 {wait_time} 秒後進行第 {attempt+1} 次重試...")
@@ -71,7 +79,8 @@ async def process_with_ai(session, text, ai_config):
                 else:
                     error_msg = await resp.text()
                     print(f"   [!] Gemini API 請求失敗 (HTTP {resp.status}): {error_msg}")
-                    return text
+                    print("   [!] API調用失敗，直接發送原文")
+                    return fail_response
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
@@ -79,8 +88,12 @@ async def process_with_ai(session, text, ai_config):
                 await asyncio.sleep(wait_time)
             else:
                 print(f"   [!] AI 處理在 {max_retries} 次嘗試後仍失敗: {e}")
-                return text
-    return text
+                print("   [!] API調用失敗，直接發送原文")
+                return fail_response
+    
+    # 所有重試結束仍未成功
+    print("   [!] API調用失敗，直接發送原文")
+    return fail_response
 
 def load_all_configs():
     """載入配置文件"""
